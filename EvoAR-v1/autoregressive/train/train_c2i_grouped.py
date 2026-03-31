@@ -133,12 +133,16 @@ def main(args):
     optimizer = creat_optimizer(model, args.weight_decay, args.lr, (args.beta1, args.beta2), logger)
     schedule_manager = ScheduleManager(
         code_len=code_len,
-        num_groups=args.initial_num_groups,
         evolve_every=args.evolve_every,
         population_size=args.schedule_population,
         mutation_prob=args.schedule_mutation_prob,
         max_groups=args.max_schedule_groups,
         device=torch.device(f"cuda:{device}"),
+        evaluation_window=args.schedule_evaluation_window,
+        crossover_prob=args.schedule_crossover_prob,
+        shift_radius=args.schedule_shift_radius,
+        block_max_size=args.schedule_block_max_size,
+        split_prob=args.schedule_split_prob,
     )
 
     dataset = build_dataset(args)
@@ -244,7 +248,8 @@ def main(args):
             gathered_records = gather_records_to_rank0(schedule_manager.pending_records, dst=0)
             schedule_manager.pending_records = []
             if rank == 0:
-                schedule_manager.pending_records = gathered_records
+                schedule_manager.ingest_records(gathered_records or [])
+                schedule_manager.pending_records = gathered_records or []
                 evolved = schedule_manager.evolve_if_needed(train_steps)
                 if evolved or (args.save_pareto_every > 0 and train_steps % args.save_pareto_every == 0):
                     save_pareto_front_plots(schedule_manager.archive, pareto_dir, train_steps)
@@ -266,7 +271,7 @@ def main(args):
                 avg_latency = avg_latency.item() / dist.get_world_size()
                 archive_summary = schedule_manager.archive_summary()
                 logger.info(
-                    f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Sample Loss: {avg_sample_loss:.4f}, Latency Proxy: {avg_latency:.4f}, Archive: {archive_summary['size']}, Evolved: {evolved}, Train Steps/Sec: {steps_per_sec:.2f}"
+                    f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Sample Loss: {avg_sample_loss:.4f}, Latency Proxy: {avg_latency:.4f}, Archive: {archive_summary['size']}, Avg Groups: {archive_summary['avg_groups']}, Evolved: {evolved}, Train Steps/Sec: {steps_per_sec:.2f}"
                 )
                 running_loss = 0.0
                 running_sample_loss = 0.0
@@ -336,10 +341,14 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default="bf16", choices=["none", "fp16", "bf16"])
-    parser.add_argument("--initial-num-groups", type=int, default=4)
-    parser.add_argument("--max-schedule-groups", type=int, default=16)
+    parser.add_argument("--max-schedule-groups", type=int, default=256)
     parser.add_argument("--schedule-population", type=int, default=32)
-    parser.add_argument("--schedule-mutation-prob", type=float, default=0.05)
+    parser.add_argument("--schedule-mutation-prob", type=float, default=0.8)
+    parser.add_argument("--schedule-crossover-prob", type=float, default=0.5)
+    parser.add_argument("--schedule-evaluation-window", type=int, default=16)
+    parser.add_argument("--schedule-shift-radius", type=int, default=4)
+    parser.add_argument("--schedule-block-max-size", type=int, default=8)
+    parser.add_argument("--schedule-split-prob", type=float, default=0.15)
     parser.add_argument("--evolve-every", type=int, default=0)
     parser.add_argument("--latency-proxy-mode", type=str, default="num_groups", choices=["num_groups", "num_groups_plus_max_group"])
     parser.add_argument("--save-pareto-every", type=int, default=0)
