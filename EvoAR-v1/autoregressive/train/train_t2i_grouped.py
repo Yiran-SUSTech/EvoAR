@@ -27,6 +27,7 @@ if str(LLAMAGEN_DIR) not in sys.path:
 
 from autoregressive.train.fitness import compute_fitness
 from autoregressive.train.mask_builder import build_training_mask
+from autoregressive.train.pareto_plot import save_pareto_front_plots
 from autoregressive.train.schedule_manager import ScheduleManager, broadcast_schedule_manager_state, gather_records_to_rank0
 from dataset.build import build_dataset
 from LlamaGen.autoregressive.models.gpt import GPT_models
@@ -48,13 +49,17 @@ def create_experiment_logger(args, rank):
     os.makedirs(checkpoint_dir, exist_ok=True)
     logger = create_logger(experiment_dir)
     logger.info(f"Experiment directory created at {experiment_dir}")
+    pareto_dir = f"{experiment_dir}/pareto_fronts"
+    os.makedirs(pareto_dir, exist_ok=True)
 
     time_record = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     cloud_results_dir = f"{args.cloud_save_path}/{time_record}"
     cloud_checkpoint_dir = f"{cloud_results_dir}/{experiment_index:03d}-{model_string_name}/checkpoints"
     os.makedirs(cloud_checkpoint_dir, exist_ok=True)
+    cloud_pareto_dir = f"{cloud_results_dir}/{experiment_index:03d}-{model_string_name}/pareto_fronts"
+    os.makedirs(cloud_pareto_dir, exist_ok=True)
     logger.info(f"Experiment directory created in cloud at {cloud_checkpoint_dir}")
-    return logger, checkpoint_dir, cloud_checkpoint_dir
+    return logger, checkpoint_dir, cloud_checkpoint_dir, pareto_dir, cloud_pareto_dir
 
 
 def main(args):
@@ -67,7 +72,7 @@ def main(args):
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
 
-    logger, checkpoint_dir, cloud_checkpoint_dir = create_experiment_logger(args, rank)
+    logger, checkpoint_dir, cloud_checkpoint_dir, pareto_dir, cloud_pareto_dir = create_experiment_logger(args, rank)
     logger.info(f"{args}")
     logger.info(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}")
 
@@ -215,6 +220,9 @@ def main(args):
             if rank == 0:
                 schedule_manager.pending_records = gathered_records
                 evolved = schedule_manager.evolve_if_needed(train_steps)
+                if evolved or (args.save_pareto_every > 0 and train_steps % args.save_pareto_every == 0):
+                    save_pareto_front_plots(schedule_manager.archive, pareto_dir, train_steps)
+                    save_pareto_front_plots(schedule_manager.archive, cloud_pareto_dir, train_steps)
             broadcast_schedule_manager_state(schedule_manager, src=0)
 
             if train_steps % args.log_every == 0:
@@ -255,6 +263,8 @@ def main(args):
                         checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                         torch.save(checkpoint, checkpoint_path)
                         logger.info(f"Saved checkpoint to {checkpoint_path}")
+                        save_pareto_front_plots(schedule_manager.archive, pareto_dir, train_steps)
+                    save_pareto_front_plots(schedule_manager.archive, cloud_pareto_dir, train_steps)
                     cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, cloud_checkpoint_path)
                     logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
@@ -309,5 +319,6 @@ if __name__ == "__main__":
     parser.add_argument("--schedule-mutation-prob", type=float, default=0.05)
     parser.add_argument("--evolve-every", type=int, default=0)
     parser.add_argument("--latency-proxy-mode", type=str, default="num_groups", choices=["num_groups", "num_groups_plus_max_group"])
+    parser.add_argument("--save-pareto-every", type=int, default=0)
     args = parser.parse_args()
     main(args)
