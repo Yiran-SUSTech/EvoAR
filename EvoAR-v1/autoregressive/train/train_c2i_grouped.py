@@ -138,11 +138,12 @@ def main(args):
         mutation_prob=args.schedule_mutation_prob,
         max_groups=args.max_schedule_groups,
         device=torch.device(f"cuda:{device}"),
-        evaluation_window=args.schedule_evaluation_window,
         crossover_prob=args.schedule_crossover_prob,
         shift_radius=args.schedule_shift_radius,
         block_max_size=args.schedule_block_max_size,
         split_prob=args.schedule_split_prob,
+        trend_weight=args.schedule_trend_weight,
+        final_loss_weight=args.schedule_final_loss_weight,
     )
 
     dataset = build_dataset(args)
@@ -251,7 +252,7 @@ def main(args):
                 schedule_manager.ingest_records(gathered_records or [])
                 schedule_manager.pending_records = gathered_records or []
                 evolved = schedule_manager.evolve_if_needed(train_steps)
-                if evolved or (args.save_pareto_every > 0 and train_steps % args.save_pareto_every == 0):
+                if evolved:
                     save_pareto_front_plots(schedule_manager.archive, pareto_dir, train_steps)
                     save_pareto_front_plots(schedule_manager.archive, cloud_pareto_dir, train_steps)
             broadcast_schedule_manager_state(schedule_manager, src=0)
@@ -296,8 +297,6 @@ def main(args):
                         checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                         torch.save(checkpoint, checkpoint_path)
                         logger.info(f"Saved checkpoint to {checkpoint_path}")
-                        save_pareto_front_plots(schedule_manager.archive, pareto_dir, train_steps)
-                    save_pareto_front_plots(schedule_manager.archive, cloud_pareto_dir, train_steps)
                     cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, cloud_checkpoint_path)
                     logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
@@ -345,12 +344,12 @@ if __name__ == "__main__":
     parser.add_argument("--schedule-population", type=int, default=32)
     parser.add_argument("--schedule-mutation-prob", type=float, default=0.8)
     parser.add_argument("--schedule-crossover-prob", type=float, default=0.5)
-    parser.add_argument("--schedule-evaluation-window", type=int, default=16)
     parser.add_argument("--schedule-shift-radius", type=int, default=4)
     parser.add_argument("--schedule-block-max-size", type=int, default=8)
     parser.add_argument("--schedule-split-prob", type=float, default=0.15)
+    parser.add_argument("--schedule-trend-weight", type=float, default=0.25)
+    parser.add_argument("--schedule-final-loss-weight", type=float, default=0.75)
     parser.add_argument("--evolve-every", type=int, default=0)
-    parser.add_argument("--latency-proxy-mode", type=str, default="num_groups", choices=["num_groups", "num_groups_plus_max_group"])
-    parser.add_argument("--save-pareto-every", type=int, default=0)
+    parser.add_argument("--latency-proxy-mode", type=str, default="stepwise_surrogate", choices=["num_groups", "num_groups_plus_max_group", "stepwise_surrogate"])
     args = parser.parse_args()
     main(args)

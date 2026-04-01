@@ -1,6 +1,5 @@
 import math
 import random
-from collections import deque
 
 import torch
 import torch.distributed as dist
@@ -17,12 +16,13 @@ class ScheduleManager:
         mutation_prob,
         max_groups=None,
         device=None,
-        evaluation_window=16,
         crossover_prob=0.5,
         mutation_weights=None,
         shift_radius=4,
         block_max_size=8,
         split_prob=0.15,
+        trend_weight=0.25,
+        final_loss_weight=0.75,
     ):
         self.code_len = int(code_len)
         self.evolve_every = max(int(evolve_every), 0)
@@ -30,11 +30,12 @@ class ScheduleManager:
         self.mutation_prob = float(mutation_prob)
         self.max_groups = int(max_groups) if max_groups is not None else self.code_len
         self.device = device
-        self.evaluation_window = max(int(evaluation_window), 1)
         self.crossover_prob = float(crossover_prob)
         self.shift_radius = max(int(shift_radius), 1)
         self.block_max_size = max(int(block_max_size), 1)
         self.split_prob = float(split_prob)
+        self.trend_weight = float(trend_weight)
+        self.final_loss_weight = float(final_loss_weight)
         self.mutation_weights = mutation_weights or {
             "merge_to_nearby_step": 0.30,
             "local_shift_step": 0.25,
@@ -42,6 +43,10 @@ class ScheduleManager:
             "local_swap_order": 0.15,
             "split_group": 0.10,
         }
+
+        total_weight = sum(self.mutation_weights.values())
+        self.mutation_weights = {key: value / total_weight for key, value in self.mutation_weights.items()}
+        self._apply_split_prob()
 
         self.population = []
         self.archive = []
@@ -58,6 +63,20 @@ class ScheduleManager:
             for _ in range(perturb_steps):
                 candidate = self.apply_mutation(candidate)
             self.population.append(candidate)
+
+    def _apply_split_prob(self):
+        current = self.mutation_weights.copy()
+        split_original = current.get("split_group", 0.0)
+        other_sum = max(1e-8, 1.0 - split_original)
+        target_split = min(max(self.split_prob, 0.0), 0.95)
+        target_other = 1.0 - target_split
+        updated = {}
+        for key, value in current.items():
+            if key == "split_group":
+                updated[key] = target_split
+            else:
+                updated[key] = value / other_sum * target_other
+        self.mutation_weights = updated
 
     def base_schedule(self, device=None):
         device = device or self.device
@@ -90,13 +109,13 @@ class ScheduleManager:
             if stats is None:
                 stats = {
                     "schedule": schedule,
-                    "loss_window": deque(maxlen=self.evaluation_window),
-                    "latency_window": deque(maxlen=self.evaluation_window),
+                    "loss_history": [],
+                    "latency_history": [],
                     "count": 0,
                 }
                 self.schedule_stats[key] = stats
-            stats["loss_window"].append(float(record["loss"]))
-            stats["latency_window"].append(float(record["latency"]))
+            stats["loss_history"].append(float(record["loss"]))
+            stats["latency_history"].append(float(record["latency"]))
             stats["count"] += 1
 
     def should_evolve(self, step):
@@ -109,6 +128,7 @@ class ScheduleManager:
         evaluated = self._build_evaluated_population()
         if not evaluated:
             self.pending_records = []
+            self._reset_cycle_stats()
             return False
 
         offspring = self._generate_offspring(evaluated)
@@ -116,12 +136,20 @@ class ScheduleManager:
         selected = self._nsga2_select(combined, self.population_size)
         if not selected:
             self.pending_records = []
+            self._reset_cycle_stats()
             return False
 
         self.population = [item["schedule"].to(self.device) for item in selected]
         self.archive = self._build_archive(combined)
         self.pending_records = []
+        self._reset_cycle_stats()
         return True
+
+    def _reset_cycle_stats(self):
+        for stats in self.schedule_stats.values():
+            stats["loss_history"] = []
+            stats["latency_history"] = []
+            stats["count"] = 0
 
     def apply_mutation(self, schedule):
         mutated = canonicalize_schedule(schedule.clone().long())
@@ -227,30 +255,47 @@ class ScheduleManager:
                 parent_b = random.choice(parents)["schedule"]
                 child = self.crossover(parent_a, parent_b)
             child = self.apply_mutation(child)
-            record = self._candidate_from_schedule(child)
-            offspring.append(record)
+            offspring.append(self._candidate_from_schedule(child))
         return offspring
 
     def _candidate_from_schedule(self, schedule):
         schedule = canonicalize_schedule(schedule.clone().long())
         key = self._schedule_key(schedule)
         stats = self.schedule_stats.get(key)
-        if stats is None or not stats["loss_window"]:
-            latency = float(schedule.max().item() + 1)
+        if stats is None or not stats["loss_history"]:
+            latency = self._fallback_latency(schedule)
             return {
                 "key": key,
                 "schedule": schedule,
                 "loss": math.inf,
                 "latency": latency,
                 "count": 0,
+                "final_loss": math.inf,
+                "trend": 0.0,
             }
+
+        loss_history = stats["loss_history"]
+        latency_history = stats["latency_history"]
+        final_loss = float(loss_history[-1])
+        trend = float(loss_history[-1] - loss_history[0]) if len(loss_history) >= 2 else 0.0
+        score = self.final_loss_weight * final_loss + self.trend_weight * trend
+        latency = float(sum(latency_history) / len(latency_history))
         return {
             "key": key,
             "schedule": stats["schedule"],
-            "loss": float(sum(stats["loss_window"]) / len(stats["loss_window"])),
-            "latency": float(sum(stats["latency_window"]) / len(stats["latency_window"])),
+            "loss": score,
+            "latency": latency,
             "count": int(stats["count"]),
+            "final_loss": final_loss,
+            "trend": trend,
         }
+
+    def _fallback_latency(self, schedule):
+        counts = torch.bincount(schedule, minlength=int(schedule.max().item()) + 1).float()
+        num_groups = float(len(counts))
+        max_group = float(counts.max().item())
+        variance_group = float(((counts - counts.mean()) ** 2).mean().item())
+        return num_groups + 0.25 * max_group + 0.05 * variance_group
 
     def _build_evaluated_population(self):
         candidates = []
@@ -280,6 +325,8 @@ class ScheduleManager:
                     "loss": item["loss"],
                     "latency": item["latency"],
                     "count": item.get("count", 0),
+                    "final_loss": item.get("final_loss", item["loss"]),
+                    "trend": item.get("trend", 0.0),
                 }
             )
         archive.sort(key=lambda item: (item["latency"], item["loss"]))
@@ -405,14 +452,16 @@ class ScheduleManager:
                     "loss": item["loss"],
                     "latency": item["latency"],
                     "count": item.get("count", 0),
+                    "final_loss": item.get("final_loss", item["loss"]),
+                    "trend": item.get("trend", 0.0),
                 }
                 for item in self.archive
             ],
             "schedule_stats": {
                 key: {
                     "schedule": value["schedule"].detach().cpu(),
-                    "loss_window": list(value["loss_window"]),
-                    "latency_window": list(value["latency_window"]),
+                    "loss_history": list(value["loss_history"]),
+                    "latency_history": list(value["latency_history"]),
                     "count": value["count"],
                 }
                 for key, value in self.schedule_stats.items()
@@ -432,8 +481,8 @@ class ScheduleManager:
             for key, value in schedule_stats.items():
                 restored[key] = {
                     "schedule": value["schedule"],
-                    "loss_window": deque(value.get("loss_window", []), maxlen=self.evaluation_window),
-                    "latency_window": deque(value.get("latency_window", []), maxlen=self.evaluation_window),
+                    "loss_history": list(value.get("loss_history", [])),
+                    "latency_history": list(value.get("latency_history", [])),
                     "count": value.get("count", 0),
                 }
             self.schedule_stats = restored
