@@ -17,7 +17,7 @@ def _normalize(values, lower, upper):
     return [(value - lower) / (upper - lower) for value in values]
 
 
-def save_pareto_front_plot(archive, output_path, title=None, width=960, height=720):
+def save_pareto_front_plot(archive, output_path, title=None, y_key="loss", y_label="loss", width=960, height=720):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -35,7 +35,7 @@ def save_pareto_front_plot(archive, output_path, title=None, width=960, height=7
     title = title or "Pareto Front"
     draw.text((left, 16), title, fill=TEXT)
     draw.text((right - 120, bottom + 28), "latency", fill=TEXT)
-    draw.text((16, top - 4), "loss", fill=TEXT)
+    draw.text((16, top - 4), y_label, fill=TEXT)
 
     if not archive:
         draw.text((left + 20, top + 20), "archive is empty", fill=TEXT)
@@ -44,14 +44,14 @@ def save_pareto_front_plot(archive, output_path, title=None, width=960, height=7
 
     points = sorted(
         [
-            (float(item["latency"]), float(item["loss"]))
+            (float(item["latency"]), float(item[y_key]))
             for item in archive
-            if math.isfinite(float(item["latency"])) and math.isfinite(float(item["loss"]))
+            if y_key in item and math.isfinite(float(item["latency"])) and math.isfinite(float(item[y_key]))
         ],
         key=lambda point: (point[0], point[1]),
     )
     if not points:
-        draw.text((left + 20, top + 20), "archive has no finite points", fill=TEXT)
+        draw.text((left + 20, top + 20), f"archive has no finite points for {y_key}", fill=TEXT)
         image.save(output_path)
         return
     xs = [point[0] for point in points]
@@ -91,7 +91,7 @@ def save_pareto_front_plot(archive, output_path, title=None, width=960, height=7
     for px, py, _, _ in pixel_points:
         draw.ellipse((px - radius, py - radius, px + radius, py + radius), fill=POINT, outline=AXIS)
 
-    summary = f"points={len(points)}  best_loss={min(ys):.4f}  best_latency={min(xs):.4f}"
+    summary = f"points={len(points)}  best_{y_key}={min(ys):.4f}  best_latency={min(xs):.4f}"
     draw.text((left, height - 36), summary, fill=TEXT)
     image.save(output_path)
 
@@ -99,5 +99,31 @@ def save_pareto_front_plot(archive, output_path, title=None, width=960, height=7
 def save_pareto_front_plots(archive, output_dir, step):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_pareto_front_plot(archive, output_dir / f"step_{step:07d}.png", title=f"Pareto Front @ step {step}")
-    save_pareto_front_plot(archive, output_dir / "latest.png", title=f"Pareto Front @ step {step}")
+    save_pareto_front_plot(
+        archive,
+        output_dir / f"step_{step:07d}_loss_score.png",
+        title=f"Pareto Front (loss score) @ step {step}",
+        y_key="loss",
+        y_label="loss score",
+    )
+    save_pareto_front_plot(
+        archive,
+        output_dir / f"step_{step:07d}_final_loss.png",
+        title=f"Pareto Front (final loss) @ step {step}",
+        y_key="final_loss",
+        y_label="final loss",
+    )
+    save_pareto_front_plot(
+        archive,
+        output_dir / "latest_loss_score.png",
+        title=f"Pareto Front (loss score) @ step {step}",
+        y_key="loss",
+        y_label="loss score",
+    )
+    save_pareto_front_plot(
+        archive,
+        output_dir / "latest_final_loss.png",
+        title=f"Pareto Front (final loss) @ step {step}",
+        y_key="final_loss",
+        y_label="final loss",
+    )
