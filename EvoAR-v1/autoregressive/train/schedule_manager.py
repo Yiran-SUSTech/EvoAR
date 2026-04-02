@@ -312,13 +312,19 @@ class ScheduleManager:
     def _build_archive(self, candidates):
         if not candidates:
             return []
-        fronts = self._nondominated_sort(candidates)
+        finite_candidates = [
+            item for item in candidates
+            if math.isfinite(item["loss"]) and math.isfinite(item["latency"])
+        ]
+        if not finite_candidates:
+            return []
+        fronts = self._nondominated_sort(finite_candidates)
         if not fronts:
             return []
         frontier = fronts[0]
         archive = []
         for idx in frontier:
-            item = candidates[idx]
+            item = finite_candidates[idx]
             archive.append(
                 {
                     "schedule": item["schedule"].detach().cpu(),

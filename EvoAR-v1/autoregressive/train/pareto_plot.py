@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -42,9 +43,17 @@ def save_pareto_front_plot(archive, output_path, title=None, width=960, height=7
         return
 
     points = sorted(
-        [(float(item["latency"]), float(item["loss"])) for item in archive],
+        [
+            (float(item["latency"]), float(item["loss"]))
+            for item in archive
+            if math.isfinite(float(item["latency"])) and math.isfinite(float(item["loss"]))
+        ],
         key=lambda point: (point[0], point[1]),
     )
+    if not points:
+        draw.text((left + 20, top + 20), "archive has no finite points", fill=TEXT)
+        image.save(output_path)
+        return
     xs = [point[0] for point in points]
     ys = [point[1] for point in points]
 

@@ -29,3 +29,26 @@ bash scripts/autoregressive/run_c2i_platform.sh \
   --schedule-final-loss-weight 0.75 \
   --evolve-every 50 \
   --latency-proxy-mode stepwise_surrogate
+
+
+
+cd /mnt/afs/zhengmingkai/zyr/EvoAR/EvoAR-v1 && \
+CUDA_VISIBLE_DEVICES=0,1 \
+bash scripts/autoregressive/run_c2i_platform.sh \
+  --code-path /mnt/afs/zhengmingkai/zyr/ExtractedCode2/imagenet_code_256_c2i_flip_ten_crop \
+  --cloud-save-path /mnt/afs/zhengmingkai/zyr/EvoAR/results_cloud/c2i_nsga2 \
+  --results-dir /mnt/afs/zhengmingkai/zyr/EvoAR/results_local/c2i_nsga2 \
+  --dataset imagenet_code \
+  --gpt-model GPT-B \
+  --gpt-type c2i \
+  --image-size 256 \
+  --downsample-size 16 \
+  --global-batch-size 64 \
+  --num-workers 4 \
+  --mixed-precision bf16 \
+  --no-compile \
+  --epochs 1 \
+  --max-schedule-groups 256 \
+  --schedule-population 8 \
+  --evolve-every 50 \
+  --latency-proxy-mode stepwise_surrogate

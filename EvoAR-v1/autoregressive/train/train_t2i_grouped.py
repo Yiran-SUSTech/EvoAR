@@ -40,7 +40,7 @@ from utils.logger import create_logger
 
 def create_experiment_logger(args, rank):
     if rank != 0:
-        return create_logger(None), None, None
+        return create_logger(None), None, None, None, None
     os.makedirs(args.results_dir, exist_ok=True)
     experiment_index = len(glob(f"{args.results_dir}/*"))
     model_string_name = args.gpt_model.replace("/", "-")
@@ -176,6 +176,8 @@ def main(args):
     running_loss = 0.0
     running_sample_loss = 0.0
     running_latency = 0.0
+    running_train_time = 0.0
+    running_evolve_time = 0.0
     start_time = time.time()
 
     logger.info(f"Training for {args.epochs} epochs...")
@@ -184,6 +186,7 @@ def main(args):
             sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, y, prefix_valid_mask, valid in loader:
+            iter_start_time = time.time()
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             prefix_valid_mask = prefix_valid_mask.to(device, non_blocking=True).bool()
@@ -220,6 +223,7 @@ def main(args):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            running_train_time += time.time() - iter_start_time
 
             running_loss += loss.item()
             running_sample_loss += fitness["sample_loss"].mean().item()
@@ -228,6 +232,7 @@ def main(args):
             train_steps += 1
 
             evolved = False
+            evolve_start_time = time.time()
             gathered_records = gather_records_to_rank0(schedule_manager.pending_records, dst=0)
             schedule_manager.pending_records = []
             if rank == 0:
@@ -238,6 +243,7 @@ def main(args):
                     save_pareto_front_plots(schedule_manager.archive, pareto_dir, train_steps)
                     save_pareto_front_plots(schedule_manager.archive, cloud_pareto_dir, train_steps)
             broadcast_schedule_manager_state(schedule_manager, src=0)
+            running_evolve_time += time.time() - evolve_start_time
 
             if train_steps % args.log_every == 0:
                 torch.cuda.synchronize()
@@ -258,12 +264,16 @@ def main(args):
                     avg_sample_loss = avg_sample_loss.item()
                     avg_latency = avg_latency.item()
                 archive_summary = schedule_manager.archive_summary()
+                avg_train_time = running_train_time / log_steps
+                avg_evolve_time = running_evolve_time / log_steps
                 logger.info(
-                    f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Sample Loss: {avg_sample_loss:.4f}, Latency Proxy: {avg_latency:.4f}, Archive: {archive_summary['size']}, Avg Groups: {archive_summary['avg_groups']}, Evolved: {evolved}, Train Steps/Sec: {steps_per_sec:.2f}"
+                    f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Sample Loss: {avg_sample_loss:.4f}, Latency Proxy: {avg_latency:.4f}, Archive: {archive_summary['size']}, Avg Groups: {archive_summary['avg_groups']}, Evolved: {evolved}, Train Steps/Sec: {steps_per_sec:.2f}, Avg Train Time: {avg_train_time:.4f}s, Avg Evolve Time: {avg_evolve_time:.4f}s"
                 )
                 running_loss = 0.0
                 running_sample_loss = 0.0
                 running_latency = 0.0
+                running_train_time = 0.0
+                running_evolve_time = 0.0
                 log_steps = 0
                 start_time = time.time()
 
