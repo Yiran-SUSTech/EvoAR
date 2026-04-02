@@ -259,18 +259,17 @@ def main(args):
             train_steps += 1
 
             evolved = False
-            evolve_start_time = time.time()
-            gathered_records = gather_records_to_rank0(schedule_manager.pending_records, dst=0)
-            schedule_manager.pending_records = []
-            if rank == 0:
-                schedule_manager.ingest_records(gathered_records or [])
-                schedule_manager.pending_records = gathered_records or []
-                evolved = schedule_manager.evolve_if_needed(train_steps)
-                if evolved:
-                    save_pareto_front_plots(schedule_manager.archive, pareto_dir, train_steps)
-                    save_pareto_front_plots(schedule_manager.archive, cloud_pareto_dir, train_steps)
-            broadcast_schedule_manager_state(schedule_manager, src=0)
-            running_evolve_time += time.time() - evolve_start_time
+            if schedule_manager.should_evolve(train_steps):
+                evolve_start_time = time.time()
+                gathered_records = gather_records_to_rank0(schedule_manager.flush_pending_records(), dst=0)
+                if rank == 0:
+                    schedule_manager.ingest_records(gathered_records or [])
+                    evolved = schedule_manager.evolve_if_needed(train_steps)
+                    if evolved:
+                        save_pareto_front_plots(schedule_manager.archive, pareto_dir, train_steps)
+                        save_pareto_front_plots(schedule_manager.archive, cloud_pareto_dir, train_steps)
+                broadcast_schedule_manager_state(schedule_manager, src=0)
+                running_evolve_time += time.time() - evolve_start_time
 
             if train_steps % args.log_every == 0:
                 torch.cuda.synchronize()

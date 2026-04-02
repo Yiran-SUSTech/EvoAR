@@ -50,7 +50,7 @@ class ScheduleManager:
 
         self.population = []
         self.archive = []
-        self.pending_records = []
+        self.pending_records = {}
         self.schedule_stats = {}
         self._initialize_population()
 
@@ -93,13 +93,24 @@ class ScheduleManager:
     def record(self, schedule_steps, sample_loss, latency_proxy):
         for idx in range(schedule_steps.shape[0]):
             schedule = canonicalize_schedule(schedule_steps[idx].detach().cpu().long())
-            self.pending_records.append(
-                {
+            key = self._schedule_key(schedule)
+            record = self.pending_records.get(key)
+            if record is None:
+                record = {
                     "schedule": schedule,
-                    "loss": float(sample_loss[idx].detach().cpu().item()),
-                    "latency": float(latency_proxy[idx].detach().cpu().item()),
+                    "loss_sum": 0.0,
+                    "latency_sum": 0.0,
+                    "count": 0,
                 }
-            )
+                self.pending_records[key] = record
+            record["loss_sum"] += float(sample_loss[idx].detach().cpu().item())
+            record["latency_sum"] += float(latency_proxy[idx].detach().cpu().item())
+            record["count"] += 1
+
+    def flush_pending_records(self):
+        flushed = list(self.pending_records.values())
+        self.pending_records = {}
+        return flushed
 
     def ingest_records(self, records):
         for record in records:
@@ -114,34 +125,39 @@ class ScheduleManager:
                     "count": 0,
                 }
                 self.schedule_stats[key] = stats
-            stats["loss_history"].append(float(record["loss"]))
-            stats["latency_history"].append(float(record["latency"]))
-            stats["count"] += 1
+            count = max(int(record.get("count", 0)), 1)
+            avg_loss = float(record.get("loss", record["loss_sum"] / count))
+            avg_latency = float(record.get("latency", record["latency_sum"] / count))
+            stats["loss_history"].append(avg_loss)
+            stats["latency_history"].append(avg_latency)
+            stats["count"] += count
 
     def should_evolve(self, step):
         return self.evolve_every > 0 and step > 0 and step % self.evolve_every == 0
 
     def evolve_if_needed(self, step):
-        if not self.should_evolve(step) or not self.pending_records:
+        if not self.should_evolve(step) or not self._has_cycle_stats():
             return False
 
         evaluated = self._build_evaluated_population()
         if not evaluated:
-            self.pending_records = []
+            self.pending_records = {}
             self._reset_cycle_stats()
             return False
 
-        offspring = self._generate_offspring(evaluated)
+        parent_pool = self._limit_candidates(evaluated, max(self.population_size, self.population_size * 2))
+        offspring = self._generate_offspring(parent_pool)
         combined = self._deduplicate_candidates(evaluated + offspring)
+        combined = self._limit_candidates(combined, max(self.population_size, self.population_size * 4))
         selected = self._nsga2_select(combined, self.population_size)
         if not selected:
-            self.pending_records = []
+            self.pending_records = {}
             self._reset_cycle_stats()
             return False
 
         self.population = [item["schedule"].to(self.device) for item in selected]
         self.archive = self._build_archive(combined)
-        self.pending_records = []
+        self.pending_records = {}
         self._reset_cycle_stats()
         return True
 
@@ -150,6 +166,9 @@ class ScheduleManager:
             stats["loss_history"] = []
             stats["latency_history"] = []
             stats["count"] = 0
+
+    def _has_cycle_stats(self):
+        return any(stats["count"] > 0 for stats in self.schedule_stats.values())
 
     def apply_mutation(self, schedule):
         mutated = canonicalize_schedule(schedule.clone().long())
@@ -338,6 +357,20 @@ class ScheduleManager:
         archive.sort(key=lambda item: (item["latency"], item["loss"]))
         return archive
 
+    def _limit_candidates(self, candidates, limit):
+        if limit <= 0 or len(candidates) <= limit:
+            return candidates
+        ranked = sorted(
+            candidates,
+            key=lambda item: (
+                not math.isfinite(item["loss"]),
+                -int(item.get("count", 0)),
+                item.get("final_loss", item["loss"]),
+                item["latency"],
+            ),
+        )
+        return ranked[:limit]
+
     def _deduplicate_candidates(self, candidates):
         dedup = {}
         for item in candidates:
@@ -513,11 +546,26 @@ def gather_records_to_rank0(records, dst=0):
     dist.gather_object(records, object_gather_list=gathered, dst=dst)
     if rank != dst:
         return None
-    merged = []
+    merged = {}
     for shard in gathered:
-        if shard:
-            merged.extend(shard)
-    return merged
+        if not shard:
+            continue
+        for record in shard:
+            schedule = canonicalize_schedule(record["schedule"].detach().cpu().long())
+            key = ScheduleManager._schedule_key(schedule)
+            merged_record = merged.get(key)
+            if merged_record is None:
+                merged_record = {
+                    "schedule": schedule,
+                    "loss_sum": 0.0,
+                    "latency_sum": 0.0,
+                    "count": 0,
+                }
+                merged[key] = merged_record
+            merged_record["loss_sum"] += float(record.get("loss_sum", record.get("loss", 0.0)))
+            merged_record["latency_sum"] += float(record.get("latency_sum", record.get("latency", 0.0)))
+            merged_record["count"] += int(record.get("count", 1))
+    return list(merged.values())
 
 
 def broadcast_schedule_manager_state(schedule_manager, src=0):
