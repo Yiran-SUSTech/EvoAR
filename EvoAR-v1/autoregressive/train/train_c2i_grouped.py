@@ -97,16 +97,18 @@ def maybe_load_checkpoint(args, model, ema, optimizer, schedule_manager, logger)
 def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
     init_distributed_mode(args)
-    assert args.global_batch_size % dist.get_world_size() == 0
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
+    distributed = bool(getattr(args, "distributed", False))
+    world_size = int(getattr(args, "world_size", 1))
+    rank = int(getattr(args, "rank", 0))
+    device = int(getattr(args, "gpu", 0)) if distributed else 0
+    assert args.global_batch_size % world_size == 0
+    seed = args.global_seed * world_size + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
 
     logger, checkpoint_dir, cloud_checkpoint_dir, pareto_dir, cloud_pareto_dir = create_experiment_logger(args, rank)
     logger.info(f"{args}")
-    logger.info(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}")
+    logger.info(f"Starting rank={rank}, seed={seed}, world_size={world_size}, distributed={distributed}")
 
     dropout_p = 0.0 if args.drop_path_rate > 0.0 else args.dropout_p
     latent_size = args.image_size // args.downsample_size
@@ -147,17 +149,19 @@ def main(args):
     )
 
     dataset = build_dataset(args)
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed,
-    )
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed,
+        )
     loader = DataLoader(
         dataset,
-        batch_size=int(args.global_batch_size // dist.get_world_size()),
-        shuffle=False,
+        batch_size=int(args.global_batch_size // world_size),
+        shuffle=not distributed,
         sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
@@ -174,8 +178,9 @@ def main(args):
     start_epoch = 0
     if args.gpt_ckpt:
         train_steps, checkpoint = maybe_load_checkpoint(args, model, ema, optimizer, schedule_manager, logger)
-        start_epoch = int(train_steps / max(int(len(dataset) / args.global_batch_size), 1))
-        train_steps = int(start_epoch * int(len(dataset) / args.global_batch_size))
+        steps_per_epoch = max(int(len(dataset) / max(int(args.global_batch_size / world_size), 1)), 1)
+        start_epoch = int(train_steps / steps_per_epoch)
+        train_steps = int(start_epoch * steps_per_epoch)
         del checkpoint
     elif args.ema:
         update_ema(ema, model, decay=0)
@@ -184,7 +189,9 @@ def main(args):
         logger.info("compiling the model...")
         model = torch.compile(model)
 
-    model = DDP(model.to(device), device_ids=[args.gpu])
+    model = model.to(device)
+    if distributed:
+        model = DDP(model, device_ids=[args.gpu])
     model.train()
     if ema is not None:
         ema.eval()
@@ -199,7 +206,8 @@ def main(args):
 
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
-        sampler.set_epoch(epoch)
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, y, prefix_valid_mask, valid in loader:
             x = x.to(device, non_blocking=True)
@@ -237,7 +245,8 @@ def main(args):
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             if ema is not None:
-                update_ema(ema, model.module._orig_mod if not args.no_compile else model.module)
+                ema_source = model.module if distributed else model
+                update_ema(ema, ema_source._orig_mod if not args.no_compile else ema_source)
 
             running_loss += loss.item()
             running_sample_loss += fitness["sample_loss"].mean().item()
@@ -264,12 +273,17 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 avg_sample_loss = torch.tensor(running_sample_loss / log_steps, device=device)
                 avg_latency = torch.tensor(running_latency / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                dist.all_reduce(avg_sample_loss, op=dist.ReduceOp.SUM)
-                dist.all_reduce(avg_latency, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                avg_sample_loss = avg_sample_loss.item() / dist.get_world_size()
-                avg_latency = avg_latency.item() / dist.get_world_size()
+                if distributed:
+                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(avg_sample_loss, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(avg_latency, op=dist.ReduceOp.SUM)
+                    avg_loss = avg_loss.item() / world_size
+                    avg_sample_loss = avg_sample_loss.item() / world_size
+                    avg_latency = avg_latency.item() / world_size
+                else:
+                    avg_loss = avg_loss.item()
+                    avg_sample_loss = avg_sample_loss.item()
+                    avg_latency = avg_latency.item()
                 archive_summary = schedule_manager.archive_summary()
                 logger.info(
                     f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Sample Loss: {avg_sample_loss:.4f}, Latency Proxy: {avg_latency:.4f}, Archive: {archive_summary['size']}, Avg Groups: {archive_summary['avg_groups']}, Evolved: {evolved}, Train Steps/Sec: {steps_per_sec:.2f}"
@@ -282,7 +296,8 @@ def main(args):
 
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
-                    model_weight = model.module._orig_mod.state_dict() if not args.no_compile else model.module.state_dict()
+                    model_source = model.module if distributed else model
+                    model_weight = model_source._orig_mod.state_dict() if not args.no_compile else model_source.state_dict()
                     checkpoint = {
                         "model": model_weight,
                         "optimizer": optimizer.state_dict(),
@@ -300,11 +315,13 @@ def main(args):
                     cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, cloud_checkpoint_path)
                     logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
-                dist.barrier()
+                if distributed:
+                    dist.barrier()
 
     model.eval()
     logger.info("Done!")
-    dist.destroy_process_group()
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -340,6 +357,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default="bf16", choices=["none", "fp16", "bf16"])
+    parser.add_argument("--dist-backend", type=str, default="nccl")
     parser.add_argument("--max-schedule-groups", type=int, default=256)
     parser.add_argument("--schedule-population", type=int, default=32)
     parser.add_argument("--schedule-mutation-prob", type=float, default=0.8)
