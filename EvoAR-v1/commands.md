@@ -16,11 +16,11 @@ bash scripts/autoregressive/run_c2i_platform.sh \
   --gpt-type c2i \
   --image-size 256 \
   --downsample-size 16 \
-  --global-batch-size 128 \
+  --global-batch-size 256 \
   --num-workers 4 \
   --mixed-precision bf16 \
   --no-compile \
-  --epochs 1 \
+  --epochs 5 \
   --max-schedule-groups 256 \
   --schedule-population 64 \
   --schedule-mutation-prob 0.8 \
@@ -30,7 +30,8 @@ bash scripts/autoregressive/run_c2i_platform.sh \
   --schedule-split-prob 0.15 \
   --schedule-trend-weight 0.25 \
   --schedule-final-loss-weight 0.75 \
-  --evolve-every 50 \
+  --evolve-every 500 \
+  --ckpt-every 5000 \
   --latency-proxy-mode stepwise_surrogate
 
 # train with fixed schedule
@@ -57,5 +58,40 @@ bash scripts/autoregressive/run_c2i_platform.sh \
   --log-every 100 \
   --ckpt-every 5000
 
-# sample with schedule
-bash scripts/autoregressive/sample_c2i.sh --vq-ckpt ./pretrained_models/vq_ds16_c2i.pt --gpt-ckpt ./pretrained_models/c2i_B.pt --gpt-model GPT-B --image-size 384 --image-size-eval 256 --cfg-scale 2.0
+# sample c2i with schedule
+cd /mnt/afs/zhengmingkai/zyr/EvoAR/EvoAR-v1 && \
+PROJECT_ROOT=/mnt/afs/zhengmingkai/zyr/EvoAR \
+LLAMAGEN_DIR=/mnt/afs/zhengmingkai/zyr/EvoAR/LlamaGen \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash scripts/autoregressive/run_sample_c2i_platform.sh \
+  --gpt-ckpt /mnt/afs/zhengmingkai/zyr/pretrained_models/c2i_B.pt \
+  --gpt-model GPT-B \
+  --image-size 384 \
+  --image-size-eval 256 \
+  --cfg-scale 2.0 \
+  --num-fid-samples 100 \
+  --schedule-index 0
+
+# sample t2i coco with schedule
+cd /mnt/afs/zhengmingkai/zyr/EvoAR/EvoAR-v1 && \
+PROJECT_ROOT=/mnt/afs/zhengmingkai/zyr/EvoAR \
+LLAMAGEN_DIR=/mnt/afs/zhengmingkai/zyr/EvoAR/LlamaGen \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash scripts/autoregressive/run_sample_t2i_coco_platform.sh \
+  --gpt-ckpt /path/to/t2i_checkpoint.pt \
+  --gpt-model GPT-XL \
+  --image-size 512 \
+  --cfg-scale 7.5 \
+  --schedule-index 0
+
+# sample t2i parti with schedule
+cd /mnt/afs/zhengmingkai/zyr/EvoAR/EvoAR-v1 && \
+PROJECT_ROOT=/mnt/afs/zhengmingkai/zyr/EvoAR \
+LLAMAGEN_DIR=/mnt/afs/zhengmingkai/zyr/EvoAR/LlamaGen \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash scripts/autoregressive/run_sample_t2i_parti_platform.sh \
+  --gpt-ckpt /path/to/t2i_checkpoint.pt \
+  --gpt-model GPT-XL \
+  --image-size 512 \
+  --cfg-scale 7.5 \
+  --schedule-index 0
