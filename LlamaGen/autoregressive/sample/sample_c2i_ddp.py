@@ -14,6 +14,7 @@ import os
 from PIL import Image
 import numpy as np
 import math
+import time
 import argparse
 
 from tokenizer.tokenizer_image.vq_model import VQ_models
@@ -140,12 +141,16 @@ def main(args):
     pbar = range(iterations)
     pbar = tqdm(pbar) if rank == 0 else pbar
     total = 0
+    ar_model_time = 0.0
+    dist.barrier()
     for _ in pbar:
         # Sample inputs:
         c_indices = torch.randint(0, args.num_classes, (n,), device=device)
         qzshape = [len(c_indices), args.codebook_embed_dim, latent_size, latent_size]
         causal_mask = build_inference_mask(c_indices, schedule) if schedule is not None else None
 
+        torch.cuda.synchronize(device)
+        ar_start_time = time.perf_counter()
         index_sample = generate(
             gpt_model, c_indices, latent_size ** 2,
             cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval,
@@ -153,6 +158,8 @@ def main(args):
             top_p=args.top_p, sample_logits=True,
             causal_mask=causal_mask,
             )
+        torch.cuda.synchronize(device)
+        ar_model_time += time.perf_counter() - ar_start_time
         
         samples = vq_model.decode_code(index_sample, qzshape) # output value is between [-1, 1]
         if args.image_size_eval != args.image_size:
@@ -165,9 +172,16 @@ def main(args):
             Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
         total += global_batch_size
 
+    ar_model_time_tensor = torch.tensor([ar_model_time], device=device, dtype=torch.float64)
+    dist.all_reduce(ar_model_time_tensor, op=dist.ReduceOp.MAX)
+    ar_model_time_total = ar_model_time_tensor.item()
+    avg_ar_time_per_image = ar_model_time_total / args.num_fid_samples
+
     # Make sure all processes have finished saving their samples before attempting to convert to .npz
     dist.barrier()
     if rank == 0:
+        print(f"AR model total sampling time: {ar_model_time_total:.6f} s")
+        print(f"AR model average time per image: {avg_ar_time_per_image:.6f} s/image")
         create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
         print("Done.")
     dist.barrier()
