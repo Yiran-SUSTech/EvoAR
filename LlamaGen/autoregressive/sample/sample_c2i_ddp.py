@@ -183,7 +183,7 @@ if __name__ == "__main__":
     parser.add_argument("--from-fsdp", action='store_true')
     parser.add_argument("--cls-token-num", type=int, default=1, help="max token number of condition input")
     parser.add_argument("--precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
-    parser.add_argument("--compile", action='store_true', default=True)
+    parser.add_argument("--compile", action='store_true', default=False)
     parser.add_argument("--vq-model", type=str, choices=list(VQ_models.keys()), default="VQ-16")
     parser.add_argument("--vq-ckpt", type=str, default=None, help="ckpt path for vq model")
     parser.add_argument("--codebook-size", type=int, default=16384, help="codebook size for vector quantization")
