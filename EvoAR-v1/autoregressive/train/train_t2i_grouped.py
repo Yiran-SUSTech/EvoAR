@@ -1,4 +1,5 @@
 import argparse
+import ast
 import os
 import sys
 import time
@@ -26,11 +27,12 @@ if str(LLAMAGEN_DIR) not in sys.path:
     sys.path.insert(0, str(LLAMAGEN_DIR))
 
 from autoregressive.train.fitness import compute_fitness
-from autoregressive.train.mask_builder import build_training_mask
+from autoregressive.train.mask_builder import build_training_mask, canonicalize_schedule
 from autoregressive.train.pareto_plot import save_pareto_front_plots
 from autoregressive.train.schedule_manager import ScheduleManager, broadcast_schedule_manager_state, gather_records_to_rank0
 from dataset.build import build_dataset
 from LlamaGen.autoregressive.models.gpt import GPT_models
+from LlamaGen.autoregressive.sample.schedule_utils import load_schedule_from_checkpoint
 from LlamaGen.autoregressive.train.train_c2i import creat_optimizer
 from LlamaGen.tokenizer.tokenizer_image.vq_model import VQ_models
 from LlamaGen.dataset.augmentation import center_crop_arr
@@ -60,6 +62,68 @@ def create_experiment_logger(args, rank):
     os.makedirs(cloud_pareto_dir, exist_ok=True)
     logger.info(f"Experiment directory created in cloud at {cloud_checkpoint_dir}")
     return logger, checkpoint_dir, cloud_checkpoint_dir, pareto_dir, cloud_pareto_dir
+
+
+def is_fixed_schedule_mode(args, checkpoint=None):
+    return (
+        args.fixed_schedule is not None
+        or args.fixed_schedule_index is not None
+        or (checkpoint is not None and checkpoint.get("schedule_mode") == "fixed")
+    )
+
+
+def parse_fixed_schedule_arg(schedule_arg):
+    if schedule_arg is None:
+        return None
+    try:
+        parsed = ast.literal_eval(schedule_arg)
+    except (SyntaxError, ValueError):
+        parsed = [int(item.strip()) for item in schedule_arg.split(",") if item.strip()]
+    if isinstance(parsed, tuple):
+        parsed = list(parsed)
+    if not isinstance(parsed, list):
+        raise ValueError("fixed schedule must be a list/tuple literal or comma-separated integers")
+    return parsed
+
+
+def resolve_fixed_schedule(args, code_len, checkpoint, logger):
+    fixed_schedule = None
+    schedule_source = None
+    if args.fixed_schedule is not None:
+        fixed_schedule = canonicalize_schedule(torch.as_tensor(parse_fixed_schedule_arg(args.fixed_schedule), dtype=torch.long))
+        schedule_source = "cli"
+    elif args.fixed_schedule_index is not None:
+        schedule_ckpt = args.fixed_schedule_ckpt or args.gpt_ckpt
+        if schedule_ckpt is None:
+            raise ValueError("fixed schedule checkpoint is required when --fixed-schedule-index is set")
+        fixed_schedule = load_schedule_from_checkpoint(
+            schedule_ckpt,
+            schedule_source=args.fixed_schedule_source,
+            schedule_index=args.fixed_schedule_index,
+        )
+        schedule_source = f"{schedule_ckpt}:{args.fixed_schedule_source}[{args.fixed_schedule_index}]"
+    elif checkpoint is not None and "fixed_schedule" in checkpoint:
+        fixed_schedule = canonicalize_schedule(torch.as_tensor(checkpoint["fixed_schedule"], dtype=torch.long))
+        schedule_source = f"{args.gpt_ckpt}:fixed_schedule"
+
+    if fixed_schedule is None:
+        return None, None
+    if fixed_schedule.ndim != 1:
+        raise ValueError("fixed schedule must be a 1D tensor")
+    if fixed_schedule.numel() != code_len:
+        raise ValueError(f"fixed schedule length {fixed_schedule.numel()} does not match code length {code_len}")
+
+    num_groups = int(fixed_schedule.max().item()) + 1
+    if num_groups > args.max_schedule_groups:
+        raise ValueError(f"fixed schedule groups {num_groups} exceed max schedule groups {args.max_schedule_groups}")
+    logger.info(
+        f"Using fixed schedule from {schedule_source} with length {fixed_schedule.numel()} and {num_groups} groups"
+    )
+    return fixed_schedule.cpu(), num_groups
+
+
+def expand_fixed_schedule(schedule, batch_size, device):
+    return schedule.to(device).unsqueeze(0).expand(batch_size, -1)
 
 
 def main(args):
@@ -93,20 +157,22 @@ def main(args):
     logger.info(f"GPT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     optimizer = creat_optimizer(model, args.weight_decay, args.lr, (args.beta1, args.beta2), logger)
-    schedule_manager = ScheduleManager(
-        code_len=code_len,
-        evolve_every=args.evolve_every,
-        population_size=args.schedule_population,
-        mutation_prob=args.schedule_mutation_prob,
-        max_groups=args.max_schedule_groups,
-        device=torch.device(f"cuda:{device}"),
-        crossover_prob=args.schedule_crossover_prob,
-        shift_radius=args.schedule_shift_radius,
-        block_max_size=args.schedule_block_max_size,
-        split_prob=args.schedule_split_prob,
-        trend_weight=args.schedule_trend_weight,
-        final_loss_weight=args.schedule_final_loss_weight,
-    )
+    schedule_manager = None
+    if args.fixed_schedule is None and args.fixed_schedule_index is None:
+        schedule_manager = ScheduleManager(
+            code_len=code_len,
+            evolve_every=args.evolve_every,
+            population_size=args.schedule_population,
+            mutation_prob=args.schedule_mutation_prob,
+            max_groups=args.max_schedule_groups,
+            device=torch.device(f"cuda:{device}"),
+            crossover_prob=args.schedule_crossover_prob,
+            shift_radius=args.schedule_shift_radius,
+            block_max_size=args.schedule_block_max_size,
+            split_prob=args.schedule_split_prob,
+            trend_weight=args.schedule_trend_weight,
+            final_loss_weight=args.schedule_final_loss_weight,
+        )
 
     vq_model = VQ_models[args.vq_model](
         codebook_size=args.codebook_size,
@@ -144,22 +210,29 @@ def main(args):
     )
     logger.info(f"Dataset contains {len(dataset):,} images")
 
+    checkpoint = None
     if args.gpt_ckpt:
         checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
         model.load_state_dict(checkpoint["model"], strict=True)
         optimizer.load_state_dict(checkpoint["optimizer"])
-        if "schedule_manager" in checkpoint:
+        if schedule_manager is not None and "schedule_manager" in checkpoint:
             schedule_manager.load_state_dict(checkpoint["schedule_manager"])
         train_steps = checkpoint["steps"] if "steps" in checkpoint else int(Path(args.gpt_ckpt).stem)
         steps_per_epoch = max(int(len(dataset) / max(int(args.global_batch_size / world_size), 1)), 1)
         start_epoch = int(train_steps / steps_per_epoch)
         train_steps = int(start_epoch * steps_per_epoch)
-        del checkpoint
         logger.info(f"Resume training from checkpoint: {args.gpt_ckpt}")
         logger.info(f"Initial state: steps={train_steps}, epochs={start_epoch}")
     else:
         train_steps = 0
         start_epoch = 0
+
+    fixed_schedule_mode = is_fixed_schedule_mode(args, checkpoint)
+    fixed_schedule, fixed_schedule_groups = resolve_fixed_schedule(args, code_len, checkpoint, logger)
+    if fixed_schedule_mode and fixed_schedule is None:
+        raise ValueError("fixed schedule mode is enabled but no fixed schedule could be resolved")
+    if not fixed_schedule_mode and checkpoint is not None:
+        del checkpoint
 
     if not args.no_compile:
         logger.info("compiling the model...")
@@ -195,7 +268,10 @@ def main(args):
                 _, _, [_, _, indices] = vq_model.encode(x)
             z_indices = indices.reshape(x.shape[0], -1).long()
             c_indices = y.reshape(y.shape[0], y.shape[-2], y.shape[-1]).to(device)
-            schedule_steps = schedule_manager.sample(z_indices.shape[0], train_steps, device=device)
+            if fixed_schedule_mode:
+                schedule_steps = expand_fixed_schedule(fixed_schedule, z_indices.shape[0], device)
+            else:
+                schedule_steps = schedule_manager.sample(z_indices.shape[0], train_steps, device=device)
             attn_mask = build_training_mask(prefix_valid_mask, schedule_steps)
 
             with torch.cuda.amp.autocast(dtype=ptdtype):
@@ -207,14 +283,17 @@ def main(args):
                     valid=valid,
                 )
 
-            fitness = compute_fitness(
-                logits=logits,
-                targets=z_indices,
-                schedule_steps=schedule_steps,
-                valid=valid,
-                latency_mode=args.latency_proxy_mode,
-            )
-            schedule_manager.record(schedule_steps, fitness["sample_loss"], fitness["latency_proxy"])
+            if fixed_schedule_mode:
+                fitness = None
+            else:
+                fitness = compute_fitness(
+                    logits=logits,
+                    targets=z_indices,
+                    schedule_steps=schedule_steps,
+                    valid=valid,
+                    latency_mode=args.latency_proxy_mode,
+                )
+                schedule_manager.record(schedule_steps, fitness["sample_loss"], fitness["latency_proxy"])
 
             scaler.scale(loss).backward()
             if args.max_grad_norm != 0.0:
@@ -226,13 +305,14 @@ def main(args):
             running_train_time += time.time() - iter_start_time
 
             running_loss += loss.item()
-            running_sample_loss += fitness["sample_loss"].mean().item()
-            running_latency += fitness["latency_proxy"].mean().item()
+            if not fixed_schedule_mode:
+                running_sample_loss += fitness["sample_loss"].mean().item()
+                running_latency += fitness["latency_proxy"].mean().item()
             log_steps += 1
             train_steps += 1
 
             evolved = False
-            if schedule_manager.should_evolve(train_steps):
+            if not fixed_schedule_mode and schedule_manager.should_evolve(train_steps):
                 evolve_start_time = time.time()
                 gathered_records = gather_records_to_rank0(schedule_manager.flush_pending_records(), dst=0)
                 if rank == 0:
@@ -249,25 +329,32 @@ def main(args):
                 end_time = time.time()
                 steps_per_sec = log_steps / (end_time - start_time)
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                avg_sample_loss = torch.tensor(running_sample_loss / log_steps, device=device)
-                avg_latency = torch.tensor(running_latency / log_steps, device=device)
                 if distributed:
                     dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(avg_sample_loss, op=dist.ReduceOp.SUM)
-                    dist.all_reduce(avg_latency, op=dist.ReduceOp.SUM)
                     avg_loss = avg_loss.item() / world_size
-                    avg_sample_loss = avg_sample_loss.item() / world_size
-                    avg_latency = avg_latency.item() / world_size
                 else:
                     avg_loss = avg_loss.item()
-                    avg_sample_loss = avg_sample_loss.item()
-                    avg_latency = avg_latency.item()
-                archive_summary = schedule_manager.archive_summary()
                 avg_train_time = running_train_time / log_steps
-                avg_evolve_time = running_evolve_time / log_steps
-                logger.info(
-                    f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Sample Loss: {avg_sample_loss:.4f}, Latency Proxy: {avg_latency:.4f}, Archive: {archive_summary['size']}, Avg Groups: {archive_summary['avg_groups']}, Evolved: {evolved}, Train Steps/Sec: {steps_per_sec:.2f}, Avg Train Time: {avg_train_time:.4f}s, Avg Evolve Time: {avg_evolve_time:.4f}s"
-                )
+                if fixed_schedule_mode:
+                    logger.info(
+                        f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Groups: {fixed_schedule_groups}, Train Steps/Sec: {steps_per_sec:.2f}, Avg Train Time: {avg_train_time:.4f}s"
+                    )
+                else:
+                    avg_sample_loss = torch.tensor(running_sample_loss / log_steps, device=device)
+                    avg_latency = torch.tensor(running_latency / log_steps, device=device)
+                    if distributed:
+                        dist.all_reduce(avg_sample_loss, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(avg_latency, op=dist.ReduceOp.SUM)
+                        avg_sample_loss = avg_sample_loss.item() / world_size
+                        avg_latency = avg_latency.item() / world_size
+                    else:
+                        avg_sample_loss = avg_sample_loss.item()
+                        avg_latency = avg_latency.item()
+                    archive_summary = schedule_manager.archive_summary()
+                    avg_evolve_time = running_evolve_time / log_steps
+                    logger.info(
+                        f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Sample Loss: {avg_sample_loss:.4f}, Latency Proxy: {avg_latency:.4f}, Archive: {archive_summary['size']}, Avg Groups: {archive_summary['avg_groups']}, Evolved: {evolved}, Train Steps/Sec: {steps_per_sec:.2f}, Avg Train Time: {avg_train_time:.4f}s, Avg Evolve Time: {avg_evolve_time:.4f}s"
+                    )
                 running_loss = 0.0
                 running_sample_loss = 0.0
                 running_latency = 0.0
@@ -285,10 +372,15 @@ def main(args):
                         "optimizer": optimizer.state_dict(),
                         "steps": train_steps,
                         "args": args,
-                        "schedule_manager": schedule_manager.state_dict(),
-                        "pareto_archive": schedule_manager.state_dict().get("archive", []),
-                        "pareto_front": schedule_manager.pareto_front_payload(),
                     }
+                    if fixed_schedule_mode:
+                        checkpoint["schedule_mode"] = "fixed"
+                        checkpoint["fixed_schedule"] = fixed_schedule.tolist()
+                        checkpoint["fixed_schedule_num_groups"] = fixed_schedule_groups
+                    else:
+                        checkpoint["schedule_manager"] = schedule_manager.state_dict()
+                        checkpoint["pareto_archive"] = schedule_manager.state_dict().get("archive", [])
+                        checkpoint["pareto_front"] = schedule_manager.pareto_front_payload()
                     if not args.no_local_save:
                         checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                         torch.save(checkpoint, checkpoint_path)
@@ -355,5 +447,9 @@ if __name__ == "__main__":
     parser.add_argument("--schedule-final-loss-weight", type=float, default=0.75)
     parser.add_argument("--evolve-every", type=int, default=0)
     parser.add_argument("--latency-proxy-mode", type=str, default="stepwise_surrogate", choices=["num_groups", "num_groups_plus_max_group", "stepwise_surrogate"])
+    parser.add_argument("--fixed-schedule", type=str, default=None)
+    parser.add_argument("--fixed-schedule-source", type=str, default="pareto_front")
+    parser.add_argument("--fixed-schedule-index", type=int, default=None)
+    parser.add_argument("--fixed-schedule-ckpt", type=str, default=None)
     args = parser.parse_args()
     main(args)
