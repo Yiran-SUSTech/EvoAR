@@ -64,12 +64,12 @@ PROJECT_ROOT=/mnt/afs/zhengmingkai/zyr/EvoAR \
 LLAMAGEN_DIR=/mnt/afs/zhengmingkai/zyr/EvoAR/LlamaGen \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 bash scripts/autoregressive/run_sample_c2i_platform.sh \
-  --gpt-ckpt /mnt/afs/zhengmingkai/zyr/pretrained_models/c2i_B.pt \
+  --gpt-ckpt /mnt/afs/zhengmingkai/zyr/EvoAR/results_local/c2i_nsga2/000-GPT-B/checkpoints/0025000.pt \
   --gpt-model GPT-B \
-  --image-size 384 \
+  --image-size 256 \
   --image-size-eval 256 \
   --cfg-scale 2.0 \
-  --num-fid-samples 100 \
+  --num-fid-samples 256 \
   --schedule-index 0
 
 # sample t2i coco with schedule

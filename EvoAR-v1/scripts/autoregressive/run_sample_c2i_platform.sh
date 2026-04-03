@@ -35,6 +35,8 @@ fi
 
 cd "$LLAMAGEN_DIR"
 
+export PYTHONPATH="$LLAMAGEN_DIR:$PYTHONPATH"
+
 echo "[run_sample_c2i_platform] using python: $PYTHON_BIN"
 echo "[run_sample_c2i_platform] project dir: $LLAMAGEN_DIR"
 echo "[run_sample_c2i_platform] MACA_PATH=$MACA_PATH"
