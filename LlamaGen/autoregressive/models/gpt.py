@@ -229,11 +229,12 @@ class Attention(nn.Module):
         keys = keys.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
         values = values.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
 
-        output = F.scaled_dot_product_attention(
-            xq, keys, values, 
-            attn_mask=mask, 
-            is_causal=True if mask is None else False, # is_causal=False is for KV cache
-            dropout_p=self.attn_dropout_p if self.training else 0)            
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+            output = F.scaled_dot_product_attention(
+                xq, keys, values,
+                attn_mask=mask,
+                is_causal=True if mask is None else False, # is_causal=False is for KV cache
+                dropout_p=self.attn_dropout_p if self.training else 0)
         
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
