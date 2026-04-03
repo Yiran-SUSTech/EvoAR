@@ -124,7 +124,7 @@ def decode_n_tokens(
 
 
 @torch.no_grad()
-def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_interval=-1, **sampling_kwargs):
+def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_interval=-1, causal_mask=None, **sampling_kwargs):
     if model.model_type == 'c2i':
         if cfg_scale > 1.0:
             cond_null = torch.ones_like(cond) * model.num_classes
@@ -161,6 +161,15 @@ def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_int
 
         eye_matrix = torch.eye(model.causal_mask.size(1), model.causal_mask.size(2), device=device)
         model.causal_mask[:] = model.causal_mask * (1 - eye_matrix) + eye_matrix
+
+    if causal_mask is not None:
+        if causal_mask.shape[0] != max_batch_size:
+            raise ValueError("causal_mask batch size must match cond batch size")
+        if causal_mask.shape[-1] != T_new:
+            raise ValueError("causal_mask width must equal condition tokens plus generated tokens")
+        if cfg_scale > 1.0:
+            causal_mask = torch.cat([causal_mask, causal_mask], dim=0)
+        model.causal_mask[: causal_mask.shape[0], :T_new, :T_new] = causal_mask.to(device=device, dtype=torch.bool).squeeze(1)
     
     # create an empty tensor of the expected final shape and fill in the current tokens
     seq = torch.empty((max_batch_size, T_new), dtype=torch.int, device=device)

@@ -287,6 +287,7 @@ def main(args):
                         "args": args,
                         "schedule_manager": schedule_manager.state_dict(),
                         "pareto_archive": schedule_manager.state_dict().get("archive", []),
+                        "pareto_front": schedule_manager.pareto_front_payload(),
                     }
                     if not args.no_local_save:
                         checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"

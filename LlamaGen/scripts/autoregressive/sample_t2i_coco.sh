@@ -9,3 +9,8 @@ autoregressive/sample/sample_t2i_ddp.py \
 --sample-dir samples_coco \
 --vq-ckpt ./pretrained_models/vq_ds16_t2i.pt \
 "$@"
+
+# Example:
+# bash scripts/autoregressive/sample_t2i_coco.sh \
+#   --gpt-ckpt /path/to/ckpt.pt \
+#   --schedule-index 0

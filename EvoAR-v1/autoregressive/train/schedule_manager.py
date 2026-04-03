@@ -507,6 +507,21 @@ class ScheduleManager:
             },
         }
 
+    def pareto_front_payload(self):
+        payload = []
+        for item in self.archive:
+            payload.append(
+                {
+                    "schedule": item["schedule"].detach().cpu().tolist(),
+                    "loss": float(item["loss"]),
+                    "latency": float(item["latency"]),
+                    "count": int(item.get("count", 0)),
+                    "final_loss": float(item.get("final_loss", item["loss"])),
+                    "trend": float(item.get("trend", 0.0)),
+                }
+            )
+        return payload
+
     def load_state_dict(self, state_dict):
         population = state_dict.get("population")
         archive = state_dict.get("archive")

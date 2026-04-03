@@ -13,6 +13,7 @@ import argparse
 from tokenizer.tokenizer_image.vq_model import VQ_models
 from autoregressive.models.gpt import GPT_models
 from autoregressive.models.generate import generate
+from autoregressive.sample.schedule_utils import build_inference_mask, load_schedule_from_checkpoint
 
 
 def main(args):
@@ -63,6 +64,18 @@ def main(args):
     del checkpoint
     print(f"gpt model is loaded")
 
+    schedule = None
+    causal_mask = None
+    if args.schedule_index is not None or args.schedule is not None:
+        schedule = load_schedule_from_checkpoint(
+            args.gpt_ckpt,
+            schedule_source=args.schedule_source,
+            schedule_index=args.schedule_index or 0,
+            schedule=args.schedule,
+        )
+        if schedule.numel() != latent_size ** 2:
+            raise ValueError(f"schedule length {schedule.numel()} does not match latent grid {latent_size ** 2}")
+
     if args.compile:
         print(f"compiling the model...")
         gpt_model = torch.compile(
@@ -77,13 +90,16 @@ def main(args):
     class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
     c_indices = torch.tensor(class_labels, device=device)
     qzshape = [len(class_labels), args.codebook_embed_dim, latent_size, latent_size]
+    if schedule is not None:
+        causal_mask = build_inference_mask(c_indices, schedule)
 
     t1 = time.time()
     index_sample = generate(
         gpt_model, c_indices, latent_size ** 2,
         cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval,
         temperature=args.temperature, top_k=args.top_k,
-        top_p=args.top_p, sample_logits=True, 
+        top_p=args.top_p, sample_logits=True,
+        causal_mask=causal_mask,
         )
     sampling_time = time.time() - t1
     print(f"gpt sampling takes about {sampling_time:.2f} seconds.")    
@@ -120,5 +136,8 @@ if __name__ == "__main__":
     parser.add_argument("--top-k", type=int, default=2000,help="top-k value to sample with")
     parser.add_argument("--temperature", type=float, default=1.0, help="temperature value to sample with")
     parser.add_argument("--top-p", type=float, default=1.0, help="top-p value to sample with")
+    parser.add_argument("--schedule-source", type=str, default="pareto_front", choices=["pareto_front", "pareto_archive"])
+    parser.add_argument("--schedule-index", type=int, default=None, help="index of schedule candidate to load from checkpoint")
+    parser.add_argument("--schedule", type=int, nargs="+", default=None, help="explicit schedule encoding override")
     args = parser.parse_args()
     main(args)

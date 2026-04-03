@@ -314,6 +314,7 @@ def main(args):
                         "args": args,
                         "schedule_manager": schedule_manager.state_dict(),
                         "pareto_archive": schedule_manager.state_dict().get("archive", []),
+                        "pareto_front": schedule_manager.pareto_front_payload(),
                     }
                     if ema is not None:
                         checkpoint["ema"] = ema.state_dict()

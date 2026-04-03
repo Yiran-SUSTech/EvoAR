@@ -7,3 +7,8 @@ torchrun \
 autoregressive/sample/sample_c2i_ddp.py \
 --vq-ckpt ./pretrained_models/vq_ds16_c2i.pt \
 "$@"
+
+# Example:
+# bash scripts/autoregressive/sample_c2i.sh \
+#   --gpt-ckpt /path/to/ckpt.pt \
+#   --schedule-index 0
