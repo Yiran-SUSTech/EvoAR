@@ -35,13 +35,13 @@ fi
 
 cd "$LLAMAGEN_DIR"
 
-export PYTHONPATH="$LLAMAGEN_DIR:$PYTHONPATH"
-
 echo "[run_sample_c2i_platform] using python: $PYTHON_BIN"
 echo "[run_sample_c2i_platform] project dir: $LLAMAGEN_DIR"
 echo "[run_sample_c2i_platform] MACA_PATH=$MACA_PATH"
 echo "[run_sample_c2i_platform] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "[run_sample_c2i_platform] MUSA_VISIBLE_DEVICES=${MUSA_VISIBLE_DEVICES:-<unset>}"
+
+export PYTHONPATH="$LLAMAGEN_DIR:$PROJECT_ROOT/EvoAR-v1:${PYTHONPATH:-}"
 
 NUM_GPUS="${SENSECORE_ACCELERATE_DEVICE_COUNT:-${NUM_GPUS:-1}}"
 NNODES="${SENSECORE_PYTORCH_NNODES:-${MLP_WORKER_NUM:-${WORLD_SIZE:-1}}}"
