@@ -12,8 +12,8 @@ import argparse
 from tokenizer.tokenizer_image.vq_model import VQ_models
 from language.t5 import T5Embedder
 from autoregressive.models.gpt import GPT_models
-from autoregressive.models.generate import generate
-from autoregressive.sample.schedule_utils import build_inference_mask, load_schedule_from_checkpoint
+from autoregressive.models.generate import generate, generate_grouped
+from autoregressive.sample.schedule_utils import analyze_schedule_realizability, build_inference_mask, build_semantic_check_lines, load_schedule_from_checkpoint
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -71,6 +71,13 @@ def main(args):
         )
         if schedule.numel() != latent_size ** 2:
             raise ValueError(f"schedule length {schedule.numel()} does not match latent grid {latent_size ** 2}")
+        schedule_stats = analyze_schedule_realizability(schedule)
+        print(
+            "Loaded grouped schedule:",
+            f"groups={schedule_stats['num_groups']}",
+            f"future_dependent_positions={schedule_stats['positions_with_future_dependencies']}/{schedule_stats['code_len']}",
+            f"future_dependency_edges={schedule_stats['future_dependency_edges']}"
+        )
 
     if args.compile:
         print(f"compiling the model...")
@@ -116,17 +123,36 @@ def main(args):
         new_caption_embs, new_emb_masks = caption_embs, emb_masks
     c_indices = new_caption_embs * new_emb_masks[:,:, None]
     c_emb_masks = new_emb_masks
+    if schedule is not None:
+        for line in build_semantic_check_lines(
+            c_emb_masks[:1],
+            schedule,
+            tag="inference-t2i",
+            mask_mode="full",
+            note="text prefix visible, earlier groups visible, same-group cross edges forbidden, future groups forbidden",
+        ):
+            print(line)
 
     qzshape = [len(c_indices), args.codebook_embed_dim, latent_size, latent_size]
     causal_mask = build_inference_mask(c_indices, schedule) if schedule is not None else None
     t1 = time.time()
-    index_sample = generate(
-        gpt_model, c_indices, latent_size ** 2,
-        c_emb_masks,
-        cfg_scale=args.cfg_scale,
-        temperature=args.temperature, top_k=args.top_k,
-        top_p=args.top_p, sample_logits=True,
-        causal_mask=causal_mask,
+    if schedule is not None:
+        index_sample = generate_grouped(
+            gpt_model, c_indices, latent_size ** 2,
+            emb_masks=c_emb_masks,
+            schedule=schedule,
+            cfg_scale=args.cfg_scale,
+            temperature=args.temperature, top_k=args.top_k,
+            top_p=args.top_p, sample_logits=True,
+        )
+    else:
+        index_sample = generate(
+            gpt_model, c_indices, latent_size ** 2,
+            c_emb_masks,
+            cfg_scale=args.cfg_scale,
+            temperature=args.temperature, top_k=args.top_k,
+            top_p=args.top_p, sample_logits=True,
+            causal_mask=causal_mask,
         )
     sampling_time = time.time() - t1
     print(f"Full sampling takes about {sampling_time:.2f} seconds.")    

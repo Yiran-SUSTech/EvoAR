@@ -12,8 +12,8 @@ import time
 import argparse
 from tokenizer.tokenizer_image.vq_model import VQ_models
 from autoregressive.models.gpt import GPT_models
-from autoregressive.models.generate import generate
-from autoregressive.sample.schedule_utils import build_inference_mask, load_schedule_from_checkpoint
+from autoregressive.models.generate import generate, generate_grouped
+from autoregressive.sample.schedule_utils import analyze_schedule_realizability, build_inference_mask, build_semantic_check_lines, load_schedule_from_checkpoint
 
 
 def main(args):
@@ -75,6 +75,21 @@ def main(args):
         )
         if schedule.numel() != latent_size ** 2:
             raise ValueError(f"schedule length {schedule.numel()} does not match latent grid {latent_size ** 2}")
+        schedule_stats = analyze_schedule_realizability(schedule)
+        print(
+            "Loaded grouped schedule:",
+            f"groups={schedule_stats['num_groups']}",
+            f"future_dependent_positions={schedule_stats['positions_with_future_dependencies']}/{schedule_stats['code_len']}",
+            f"future_dependency_edges={schedule_stats['future_dependency_edges']}"
+        )
+        for line in build_semantic_check_lines(
+            torch.ones((1, 1), dtype=torch.bool),
+            schedule,
+            tag="inference-c2i",
+            mask_mode="full",
+            note="semantic mask requirement for grouped inference: prefix+earlier groups visible, same-group cross edges forbidden, future groups forbidden",
+        ):
+            print(line)
 
     if args.compile:
         print(f"compiling the model...")
@@ -94,12 +109,21 @@ def main(args):
         causal_mask = build_inference_mask(c_indices, schedule)
 
     t1 = time.time()
-    index_sample = generate(
-        gpt_model, c_indices, latent_size ** 2,
-        cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval,
-        temperature=args.temperature, top_k=args.top_k,
-        top_p=args.top_p, sample_logits=True,
-        causal_mask=causal_mask,
+    if schedule is not None:
+        index_sample = generate_grouped(
+            gpt_model, c_indices, latent_size ** 2,
+            schedule=schedule,
+            cfg_scale=args.cfg_scale,
+            temperature=args.temperature, top_k=args.top_k,
+            top_p=args.top_p, sample_logits=True,
+        )
+    else:
+        index_sample = generate(
+            gpt_model, c_indices, latent_size ** 2,
+            cfg_scale=args.cfg_scale, cfg_interval=args.cfg_interval,
+            temperature=args.temperature, top_k=args.top_k,
+            top_p=args.top_p, sample_logits=True,
+            causal_mask=causal_mask,
         )
     sampling_time = time.time() - t1
     print(f"gpt sampling takes about {sampling_time:.2f} seconds.")    

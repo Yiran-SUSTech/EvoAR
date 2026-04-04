@@ -42,6 +42,29 @@ def compute_latency_proxy(schedule_steps, mode="stepwise_surrogate"):
     return torch.tensor(proxies, device=schedule_steps.device, dtype=torch.float32)
 
 
+def compute_grouped_step_loss(logits, targets, positions, valid=None):
+    positions = torch.as_tensor(positions, dtype=torch.long, device=logits.device)
+    step_logits = logits[:, positions, :]
+    step_targets = targets[:, positions]
+    batch_size, step_len, vocab_size = step_logits.shape
+    loss_all = F.cross_entropy(
+        step_logits.reshape(batch_size * step_len, vocab_size),
+        step_targets.reshape(batch_size * step_len),
+        reduction="none",
+    ).reshape(batch_size, step_len)
+
+    if valid is None:
+        sample_loss = loss_all.mean(dim=1)
+        return sample_loss.mean(), sample_loss.detach(), loss_all.detach()
+
+    valid = valid.to(loss_all.device).float().reshape(batch_size, 1)
+    weighted_loss = loss_all * valid
+    sample_denom = (valid * step_len).clamp_min(1.0)
+    sample_loss = weighted_loss.sum(dim=1, keepdim=True) / sample_denom
+    total_denom = sample_denom.sum().clamp_min(1.0)
+    return weighted_loss.sum() / total_denom, sample_loss.squeeze(1).detach(), loss_all.detach()
+
+
 def compute_fitness(logits, targets, schedule_steps, valid=None, latency_mode="stepwise_surrogate"):
     sample_loss, token_loss = compute_samplewise_loss(logits, targets, valid=valid)
     latency = compute_latency_proxy(schedule_steps, mode=latency_mode)

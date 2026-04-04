@@ -274,6 +274,7 @@ class Transformer(nn.Module):
         else:
             raise Exception("please check model type")
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        self.latent_placeholder = nn.Parameter(torch.zeros(1, 1, config.dim))
         self.tok_dropout = nn.Dropout(config.token_dropout_p)
 
         # transformer blocks
@@ -297,9 +298,10 @@ class Transformer(nn.Module):
 
         self.initialize_weights()
 
-    def initialize_weights(self):        
+    def initialize_weights(self):
         # Initialize nn.Linear and nn.Embedding
         self.apply(self._init_weights)
+        nn.init.normal_(self.latent_placeholder, mean=0.0, std=self.config.initializer_range)
 
         # Zero-out output layers:
         nn.init.constant_(self.output.weight, 0)
@@ -330,51 +332,62 @@ class Transformer(nn.Module):
         self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head, self.config.rope_base, self.cls_token_num)
 
     def forward(
-        self, 
-        idx: torch.Tensor, 
+        self,
+        idx: torch.Tensor,
         cond_idx: torch.Tensor,  # cond_idx_or_embed
-        input_pos:  Optional[torch.Tensor] = None, 
+        input_pos: Optional[torch.Tensor] = None,
         targets: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
         valid: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
     ):
-        if idx is not None and cond_idx is not None: # training or naive inference
-            cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
+        if idx is not None and cond_idx is not None:
+            cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:, :self.cls_token_num]
             token_embeddings = self.tok_embeddings(idx)
+            if token_mask is not None:
+                token_mask = token_mask.to(device=token_embeddings.device, dtype=torch.bool)
+                placeholder = self.latent_placeholder.to(dtype=token_embeddings.dtype).expand(token_embeddings.shape[0], token_embeddings.shape[1], -1)
+                token_embeddings = torch.where(token_mask.unsqueeze(-1), placeholder, token_embeddings)
             token_embeddings = torch.cat((cond_embeddings, token_embeddings), dim=1)
             h = self.tok_dropout(token_embeddings)
             self.freqs_cis = self.freqs_cis.to(h.device)
+            if input_pos is None:
+                input_pos = torch.arange(token_embeddings.shape[1], device=h.device)
         else:
-            if cond_idx is not None: # prefill in inference
-                token_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
-            else: # decode_n_tokens(kv cache) in inference
+            if cond_idx is not None and idx is None:
+                token_embeddings = self.cls_embedding(cond_idx, train=self.training)[:, :self.cls_token_num]
+            elif idx is not None and cond_idx is None:
                 token_embeddings = self.tok_embeddings(idx)
-            
+                if token_mask is not None:
+                    token_mask = token_mask.to(device=token_embeddings.device, dtype=torch.bool)
+                    placeholder = self.latent_placeholder.to(dtype=token_embeddings.dtype).expand(token_embeddings.shape[0], token_embeddings.shape[1], -1)
+                    token_embeddings = torch.where(token_mask.unsqueeze(-1), placeholder, token_embeddings)
+            else:
+                raise ValueError("inference path expects exactly one of idx or cond_idx")
+
             bs = token_embeddings.shape[0]
-            mask = self.causal_mask[:bs, None, input_pos]
+            if mask is None:
+                mask = self.causal_mask[:bs, None, input_pos]
             h = self.tok_dropout(token_embeddings)
-            self.freqs_cis = self.freqs_cis
-        
-        if self.training:
-            freqs_cis = self.freqs_cis[:token_embeddings.shape[1]]
+            self.freqs_cis = self.freqs_cis.to(h.device)
+
+        if self.training or (idx is not None and cond_idx is not None and input_pos.ndim == 1 and input_pos.numel() == token_embeddings.shape[1]):
+            freqs_cis = self.freqs_cis[input_pos]
         else:
             freqs_cis = self.freqs_cis[input_pos]
-        # transformer blocks
         for layer in self.layers:
             h = layer(h, freqs_cis, input_pos, mask)
-        
-        # output layers
+
         h = self.norm(h)
         logits = self.output(h).float()
-        
-        if self.training:
+
+        if self.training and targets is not None:
             logits = logits[:, self.cls_token_num - 1:].contiguous()
 
-        # if we are given some desired targets also calculate the loss
         loss = None
         if valid is not None:
             loss_all = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), reduction='none')
-            valid_all = valid[:,None].repeat(1, targets.shape[1]).view(-1)
+            valid_all = valid[:, None].repeat(1, targets.shape[1]).view(-1)
             loss = (loss_all * valid_all).sum() / max(valid_all.sum(), 1)
         elif targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))

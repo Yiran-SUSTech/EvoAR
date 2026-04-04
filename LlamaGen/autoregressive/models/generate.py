@@ -11,6 +11,8 @@ import copy
 # torch._inductor.config.triton.unique_kernel_names = True
 # torch._inductor.config.fx_graph_cache = True # Experimental feature to reduce compilation times, will be on by default in future
 
+from autoregressive.sample.schedule_utils import build_grouped_block_mask, build_grouped_step_mask, schedule_to_groups
+
 
 ### from https://huggingface.co/transformers/v3.2.0/_modules/transformers/generation_utils.html
 def top_k_top_p_filtering(
@@ -103,7 +105,7 @@ def decode_one_token(model, x: torch.Tensor, input_pos: torch.Tensor, cfg_scale:
 
 
 def decode_n_tokens(
-    model, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, 
+    model, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int,
     cfg_scale: float, cfg_interval: int,
     **sampling_kwargs):
     new_tokens, new_probs = [], []
@@ -119,8 +121,110 @@ def decode_n_tokens(
             new_tokens.append(next_token.clone())
             new_probs.append(next_prob.clone())
             cur_token = next_token.view(-1, 1)
-    
+
     return new_tokens, new_probs
+
+
+def sample_tokens(logits, temperature: float = 1.0, top_k: int = 0, top_p: float = 1.0, sample_logits=True):
+    original_shape = logits.shape[:-1]
+    logits = logits.reshape(-1, logits.shape[-1]) / max(temperature, 1e-5)
+    if top_k > 0 or top_p < 1.0:
+        logits = top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
+    probs = F.softmax(logits, dim=-1)
+    if sample_logits:
+        idx = torch.multinomial(probs, num_samples=1)
+    else:
+        _, idx = torch.topk(probs, k=1, dim=-1)
+    return idx.view(*original_shape, 1), probs.view(*original_shape, -1)
+
+
+@torch.no_grad()
+def generate_grouped(model, cond, max_new_tokens, emb_masks=None, schedule=None, cfg_scale=1.0, **sampling_kwargs):
+    if schedule is None:
+        return generate(model, cond, max_new_tokens, emb_masks=emb_masks, cfg_scale=cfg_scale, **sampling_kwargs)
+
+    device = cond.device
+    schedule = torch.as_tensor(schedule, dtype=torch.long, device=device)
+    if schedule.ndim != 1 or schedule.numel() != max_new_tokens:
+        raise ValueError("schedule must be a 1D tensor with length equal to max_new_tokens")
+    grouped_positions = schedule_to_groups(schedule)
+
+    if model.model_type == 'c2i':
+        prefix_len = 1
+        prefix_valid_mask = torch.ones((cond.shape[0], 1), dtype=torch.bool, device=device)
+        if cfg_scale > 1.0:
+            cond_null = torch.ones_like(cond) * model.num_classes
+            cond_combined = torch.cat([cond, cond_null])
+        else:
+            cond_combined = cond
+    elif model.model_type == 't2i':
+        prefix_len = cond.shape[1]
+        prefix_valid_mask = emb_masks.to(device=device, dtype=torch.bool) if emb_masks is not None else torch.ones((cond.shape[0], prefix_len), dtype=torch.bool, device=device)
+        if cfg_scale > 1.0:
+            cond_null = torch.zeros_like(cond) + model.cls_embedding.uncond_embedding
+            cond_combined = torch.cat([cond, cond_null])
+        else:
+            cond_combined = cond
+    else:
+        raise Exception("please check model type")
+
+    max_batch_size = cond.shape[0]
+    max_seq_length = prefix_len + max_new_tokens
+    with torch.device(device):
+        max_batch_size_cfg = max_batch_size * 2 if cfg_scale > 1.0 else max_batch_size
+        model.setup_caches(max_batch_size=max_batch_size_cfg, max_seq_length=max_seq_length, dtype=model.tok_embeddings.weight.dtype)
+
+    if emb_masks is not None:
+        if cfg_scale > 1.0:
+            model.causal_mask[:, :prefix_len, :prefix_len] = model.causal_mask[:, :prefix_len, :prefix_len] * torch.cat([prefix_valid_mask, prefix_valid_mask]).unsqueeze(1)
+        else:
+            model.causal_mask[:, :prefix_len, :prefix_len] = model.causal_mask[:, :prefix_len, :prefix_len] * prefix_valid_mask.unsqueeze(1)
+
+    seq = torch.zeros((cond.shape[0], max_new_tokens), dtype=torch.long, device=device)
+    generated = torch.zeros(max_new_tokens, dtype=torch.bool, device=device)
+
+    input_pos = torch.arange(0, prefix_len, device=device)
+    model(None, cond_combined, input_pos)
+
+    for current_positions in grouped_positions:
+        block_tokens = seq[:, current_positions]
+        block_mask = torch.ones_like(block_tokens, dtype=torch.bool, device=device)
+        input_pos = prefix_len + current_positions
+        attention_mask = build_grouped_block_mask(prefix_valid_mask, schedule, generated, current_positions)
+        if cfg_scale > 1.0:
+            block_tokens = torch.cat([block_tokens, block_tokens], dim=0)
+            block_mask = torch.cat([block_mask, block_mask], dim=0)
+            attention_mask = torch.cat([attention_mask, attention_mask], dim=0)
+
+        logits, _ = model(
+            idx=block_tokens,
+            cond_idx=None,
+            input_pos=input_pos,
+            mask=attention_mask,
+            token_mask=block_mask,
+        )
+        if cfg_scale > 1.0:
+            cond_logits, uncond_logits = torch.split(logits, len(logits) // 2, dim=0)
+            logits = uncond_logits + (cond_logits - uncond_logits) * cfg_scale
+
+        sampled_tokens, _ = sample_tokens(logits, **sampling_kwargs)
+        seq[:, current_positions] = sampled_tokens.squeeze(-1)
+        generated[current_positions] = True
+
+        if current_positions.numel() > 0:
+            committed_tokens = seq[:, current_positions]
+            commit_mask = build_grouped_block_mask(prefix_valid_mask, schedule, generated, current_positions)
+            if cfg_scale > 1.0:
+                committed_tokens = torch.cat([committed_tokens, committed_tokens], dim=0)
+                commit_mask = torch.cat([commit_mask, commit_mask], dim=0)
+            model(
+                idx=committed_tokens,
+                cond_idx=None,
+                input_pos=prefix_len + current_positions,
+                mask=commit_mask,
+            )
+
+    return seq
 
 
 @torch.no_grad()

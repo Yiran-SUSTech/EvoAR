@@ -9,7 +9,6 @@ cd /mnt/afs/zhengmingkai/zyr/EvoAR/EvoAR-v1 && \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 bash scripts/autoregressive/run_c2i_platform.sh \
   --code-path /mnt/afs/zhengmingkai/zyr/ExtractedCode2/imagenet_code_256_c2i_flip_ten_crop \
-  --cloud-save-path /mnt/afs/zhengmingkai/zyr/EvoAR/results_cloud/c2i_nsga2 \
   --results-dir /mnt/afs/zhengmingkai/zyr/EvoAR/results_local/c2i_nsga2 \
   --dataset imagenet_code \
   --gpt-model GPT-B \
@@ -20,7 +19,7 @@ bash scripts/autoregressive/run_c2i_platform.sh \
   --num-workers 4 \
   --mixed-precision bf16 \
   --no-compile \
-  --epochs 5 \
+  --epochs 100 \
   --max-schedule-groups 256 \
   --schedule-population 64 \
   --schedule-mutation-prob 0.8 \
@@ -31,7 +30,7 @@ bash scripts/autoregressive/run_c2i_platform.sh \
   --schedule-trend-weight 0.25 \
   --schedule-final-loss-weight 0.75 \
   --evolve-every 500 \
-  --ckpt-every 5000 \
+  --ckpt-every 50000 \
   --latency-proxy-mode stepwise_surrogate
 
 # train with fixed schedule
@@ -95,3 +94,7 @@ bash scripts/autoregressive/run_sample_t2i_parti_platform.sh \
   --image-size 512 \
   --cfg-scale 7.5 \
   --schedule-index 0
+
+# evaluate
+cd /mnt/afs/zhengmingkai/zyr/EvoAR/LlamaGen && 
+python evaluations/c2i/evaluator.py /mnt/afs/zhengmingkai/zyr/EvoAR/LlamaGen/VIRTUAL_imagenet256_labeled.npz /mnt/afs/zhengmingkai/zyr/EvoAR/LlamaGen/samples/GPT-B-0025000-size-256-size-256-VQ-16-topk-0-topp-1.0-temperature-1.0-cfg-2.0-seed-0.npz

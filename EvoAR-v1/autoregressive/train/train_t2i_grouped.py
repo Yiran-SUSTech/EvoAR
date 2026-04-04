@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -26,13 +27,13 @@ if str(PARENT_DIR) not in sys.path:
 if str(LLAMAGEN_DIR) not in sys.path:
     sys.path.insert(0, str(LLAMAGEN_DIR))
 
-from autoregressive.train.fitness import compute_fitness
+from autoregressive.train.fitness import compute_fitness, compute_grouped_step_loss
 from autoregressive.train.mask_builder import build_training_mask, canonicalize_schedule
 from autoregressive.train.pareto_plot import save_pareto_front_plots
 from autoregressive.train.schedule_manager import ScheduleManager, broadcast_schedule_manager_state, gather_records_to_rank0
 from dataset.build import build_dataset
 from LlamaGen.autoregressive.models.gpt import GPT_models
-from LlamaGen.autoregressive.sample.schedule_utils import load_schedule_from_checkpoint
+from LlamaGen.autoregressive.sample.schedule_utils import build_grouped_compact_mask, build_semantic_check_lines, load_schedule_from_checkpoint, schedule_to_groups
 from LlamaGen.autoregressive.train.train_c2i import creat_optimizer
 from LlamaGen.tokenizer.tokenizer_image.vq_model import VQ_models
 from LlamaGen.dataset.augmentation import center_crop_arr
@@ -124,6 +125,34 @@ def resolve_fixed_schedule(args, code_len, checkpoint, logger):
 
 def expand_fixed_schedule(schedule, batch_size, device):
     return schedule.to(device).unsqueeze(0).expand(batch_size, -1)
+
+
+def compute_fixed_schedule_group_loss(model, cond_idx, z_indices, prefix_valid_mask, schedule, valid):
+    grouped_positions = schedule_to_groups(schedule)
+    total_loss = torch.zeros((), device=z_indices.device, dtype=torch.float32)
+    total_sample_loss = torch.zeros(z_indices.shape[0], device=z_indices.device, dtype=torch.float32)
+    step_count = max(len(grouped_positions), 1)
+    generated = torch.zeros(schedule.shape[0], dtype=torch.bool, device=z_indices.device)
+
+    for positions in grouped_positions:
+        compact_mask, earlier_positions, compact_positions = build_grouped_compact_mask(prefix_valid_mask, generated, positions)
+        compact_idx = z_indices[:, compact_positions]
+        token_mask = torch.zeros_like(compact_idx, dtype=torch.bool, device=z_indices.device)
+        if positions.numel() > 0:
+            token_mask[:, earlier_positions.numel():] = True
+        logits, _ = model(
+            cond_idx=cond_idx,
+            idx=compact_idx,
+            mask=compact_mask,
+            token_mask=token_mask,
+        )
+        latent_logits = logits[:, prefix_valid_mask.shape[1] + earlier_positions.numel():, :]
+        step_loss, step_sample_loss, _ = compute_grouped_step_loss(latent_logits, z_indices, positions, valid=valid)
+        total_loss = total_loss + step_loss
+        total_sample_loss = total_sample_loss + step_sample_loss
+        generated[positions] = True
+
+    return total_loss / step_count, total_sample_loss / step_count
 
 
 def main(args):
@@ -253,6 +282,7 @@ def main(args):
     running_evolve_time = 0.0
     start_time = time.time()
 
+    semantic_log_emitted = False
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(start_epoch, args.epochs):
         if sampler is not None:
@@ -273,15 +303,39 @@ def main(args):
             else:
                 schedule_steps = schedule_manager.sample(z_indices.shape[0], train_steps, device=device)
             attn_mask = build_training_mask(prefix_valid_mask, schedule_steps)
+            if rank == 0 and not semantic_log_emitted:
+                semantic_tag = "train-fixed-t2i" if fixed_schedule_mode else "train-search-t2i"
+                semantic_mode = "compact" if fixed_schedule_mode else "full"
+                semantic_note = "fixed schedule compact grouped training" if fixed_schedule_mode else "search stage grouped-mask surrogate training"
+                for line in build_semantic_check_lines(
+                    prefix_valid_mask[:1],
+                    schedule_steps[0],
+                    tag=semantic_tag,
+                    mask_mode=semantic_mode,
+                    note=semantic_note,
+                ):
+                    logger.info(line)
+                semantic_log_emitted = True
 
             with torch.cuda.amp.autocast(dtype=ptdtype):
-                logits, loss = model(
-                    cond_idx=c_indices,
-                    idx=z_indices[:, :-1],
-                    targets=z_indices,
-                    mask=attn_mask[:, :, :-1, :-1],
-                    valid=valid,
-                )
+                if fixed_schedule_mode:
+                    logits = None
+                    loss, fixed_sample_loss = compute_fixed_schedule_group_loss(
+                        model,
+                        c_indices,
+                        z_indices,
+                        prefix_valid_mask,
+                        fixed_schedule.to(device),
+                        valid,
+                    )
+                else:
+                    logits, loss = model(
+                        cond_idx=c_indices,
+                        idx=z_indices[:, :-1],
+                        targets=z_indices,
+                        mask=attn_mask[:, :, :-1, :-1],
+                        valid=valid,
+                    )
 
             if fixed_schedule_mode:
                 fitness = None
@@ -305,7 +359,9 @@ def main(args):
             running_train_time += time.time() - iter_start_time
 
             running_loss += loss.item()
-            if not fixed_schedule_mode:
+            if fixed_schedule_mode:
+                running_sample_loss += fixed_sample_loss.mean().item()
+            else:
                 running_sample_loss += fitness["sample_loss"].mean().item()
                 running_latency += fitness["latency_proxy"].mean().item()
             log_steps += 1
@@ -336,8 +392,14 @@ def main(args):
                     avg_loss = avg_loss.item()
                 avg_train_time = running_train_time / log_steps
                 if fixed_schedule_mode:
+                    avg_sample_loss = torch.tensor(running_sample_loss / log_steps, device=device)
+                    if distributed:
+                        dist.all_reduce(avg_sample_loss, op=dist.ReduceOp.SUM)
+                        avg_sample_loss = avg_sample_loss.item() / world_size
+                    else:
+                        avg_sample_loss = avg_sample_loss.item()
                     logger.info(
-                        f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Groups: {fixed_schedule_groups}, Train Steps/Sec: {steps_per_sec:.2f}, Avg Train Time: {avg_train_time:.4f}s"
+                        f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Sample Loss: {avg_sample_loss:.4f}, Groups: {fixed_schedule_groups}, Train Steps/Sec: {steps_per_sec:.2f}, Avg Train Time: {avg_train_time:.4f}s"
                     )
                 else:
                     avg_sample_loss = torch.tensor(running_sample_loss / log_steps, device=device)
